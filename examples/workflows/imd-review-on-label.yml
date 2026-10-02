@@ -1,0 +1,50 @@
+# Adversarial review of a pull request's branch when a maintainer adds the
+# "imd-review" label. Copy to .github/workflows/imd-review-on-label.yml.
+#
+# Pays only when the repository variable IMD_LIVE is "true"; otherwise it is a
+# dry run. Pull requests from forks are refused by the action (and get no
+# secrets anyway). Never switch this to pull_request_target: the action refuses it.
+name: IMD review on label
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency: imd-paid-requests
+
+jobs:
+  review:
+    if: github.event.label.name == 'imd-review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the request
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          jq -n --arg n "$PR_NUMBER" --arg title "$PR_TITLE" --arg base "$BASE_REF" '{
+            objective: ("Adversarially review pull request #" + $n + " (" + $title + ") against " + $base + ". Look for bugs, security issues and broken invariants; reproduce each finding."),
+            skill: "adversarial-review",
+            github: false
+          }' > imd-input.json
+
+      - name: Open the review
+        id: imd
+        uses: your-org/imd-action@<sha>
+        with:
+          action: job.open
+          input: imd-input.json
+          import-repo: true
+          private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          dry-run: ${{ vars.IMD_LIVE != 'true' }}
+          max-imd: '0.5'
+          max-imd-per-day: '2'
+
+      - name: Summary
+        run: |
+          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"

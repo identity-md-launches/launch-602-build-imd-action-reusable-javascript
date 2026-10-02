@@ -1,0 +1,49 @@
+# Audit the default branch with the IMD swarm (template: audit), on manual dispatch.
+# Copy to .github/workflows/imd-audit.yml. Replace your-org/imd-action@<sha> with
+# this action's repository and a pinned commit.
+name: IMD audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      objective:
+        description: What to audit
+        default: Audit this repository for security issues, with reproductions for every finding.
+      pay:
+        description: Pay for it (0.5 IMD). Leave off for a dry run.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: imd-paid-requests
+
+jobs:
+  audit:
+    # Only the default branch is audited.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the request
+        env:
+          OBJECTIVE: ${{ inputs.objective }}
+        run: |
+          jq -n --arg objective "$OBJECTIVE" '{objective: $objective, template: "audit"}' > imd-input.json
+
+      - name: Open the audit
+        id: imd
+        uses: your-org/imd-action@<sha>
+        with:
+          action: job.open
+          input: imd-input.json
+          import-repo: true
+          private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          dry-run: ${{ !inputs.pay }}
+          max-imd: '0.5'
+          wait: true
+
+      - name: Summary
+        run: |
+          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"

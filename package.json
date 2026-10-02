@@ -1,0 +1,30 @@
+{
+  "name": "imd-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental GitHub Action that opens a paid IMD swarm request from CI.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "imd-action": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc && rollup -c",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@noble/curves": "file:vendor/npm/noble-curves-1.9.7.tgz",
+    "@noble/hashes": "file:vendor/npm/noble-hashes-1.8.0.tgz"
+  },
+  "devDependencies": {
+    "@types/node": "file:vendor/npm/types-node-20.19.43.tgz",
+    "rollup": "file:vendor/npm/rollup-3.30.0.tgz",
+    "typescript": "file:vendor/npm/typescript-5.9.3.tgz",
+    "undici-types": "file:vendor/npm/undici-types-6.21.0.tgz"
+  }
+}

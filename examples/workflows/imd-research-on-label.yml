@@ -1,0 +1,49 @@
+# A sourced research report on an issue's question when a maintainer adds the
+# "imd-research" label. Copy to .github/workflows/imd-research-on-label.yml.
+#
+# Pays only when the repository variable IMD_LIVE is "true"; otherwise it is a
+# dry run.
+name: IMD research on label
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency: imd-paid-requests
+
+jobs:
+  research:
+    if: github.event.label.name == 'imd-research'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the request
+        env:
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          jq -n --arg title "$TITLE" --arg body "${BODY:0:3000}" '{
+            objective: ("Write a sourced research report answering: " + $title + "\n\n" + $body),
+            skill: "research-report",
+            outputs: [{name: "report", path: "artifacts/report.md", mediaType: "text/markdown"}],
+            minCitations: 5,
+            github: false
+          }' > imd-input.json
+
+      - name: Open the report
+        id: imd
+        uses: your-org/imd-action@<sha>
+        with:
+          action: job.open
+          input: imd-input.json
+          private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          dry-run: ${{ vars.IMD_LIVE != 'true' }}
+          max-imd: '0.5'
+          max-imd-per-day: '2'
+
+      - name: Summary
+        run: |
+          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"

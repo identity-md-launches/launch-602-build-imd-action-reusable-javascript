@@ -1,0 +1,74 @@
+name: imd-action
+description: >-
+  Open a paid IMD swarm request from CI. Experimental, commissioned as a test of the IMD swarm.
+  It may not work as described. Read the code, start with small amounts, no warranty.
+author: imd-action contributors
+branding:
+  icon: send
+  color: purple
+
+inputs:
+  action:
+    description: 'Paid action: job.open, job.continue, launch.open, oracle.request, workflow.open, schedule.create or schedule.topup.'
+    required: true
+  input:
+    description: 'The action input: an inline JSON object, or a path (relative to the workspace) to a JSON file.'
+    required: true
+  private-key:
+    description: 'Wallet private key. Pass it only as ${{ secrets.YOUR_SECRET }}. Not needed for a dry run.'
+    required: false
+    default: ''
+  dry-run:
+    description: 'true (default): quote and verify the payment challenge, but never sign or pay. Set to false to pay.'
+    required: false
+    default: 'true'
+  max-imd:
+    description: 'Per-request cap in IMD. A quote above it is refused before signing.'
+    required: false
+    default: '0.5'
+  max-imd-per-day:
+    description: 'Cap on IMD this wallet paid in the last 24 hours (read from GET /requests/paid-by), including this request.'
+    required: false
+    default: '1'
+  wait:
+    description: 'Poll the order until it leaves quoted, payment_pending and admission_pending.'
+    required: false
+    default: 'false'
+  wait-timeout:
+    description: 'Seconds to keep polling when wait is true.'
+    required: false
+    default: '1800'
+  poll-interval:
+    description: 'Seconds between polls.'
+    required: false
+    default: '10'
+  import-repo:
+    description: 'Resolve this public repository and branch with POST /requests/import and fill repoUrl and baseCommit in the input.'
+    required: false
+    default: 'false'
+  import-kind:
+    description: 'Kind passed to POST /requests/import: code, contracts or site.'
+    required: false
+    default: 'code'
+  check:
+    description: "Ask POST /requests/check for the evaluator's verdict first (free; retried up to 3 times because it is noisy)."
+    required: false
+    default: 'true'
+  api-url:
+    description: 'IMD API base URL.'
+    required: false
+    default: 'https://api.imd.fun'
+
+outputs:
+  order-id:
+    description: 'The IMD order id.'
+  job-id:
+    description: 'The job id once admitted (empty for a dry run, a schedule, or while still pending).'
+  job-url:
+    description: 'https://explorer.imd.fun/jobs/<job-id>'
+  status:
+    description: 'Order status (quoted, payment_pending, admission_pending, admitted, payment_failed, expired), or dry-run.'
+
+runs:
+  using: node20
+  main: dist/index.js
