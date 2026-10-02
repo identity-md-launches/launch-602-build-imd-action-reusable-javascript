@@ -23,8 +23,8 @@ export function readEventPayload(): Payload {
 function crossRepo(head: Repo, base: Repo): boolean {
   // A deleted head repository (null) is treated as a fork.
   if (!head || !head.full_name) return true;
-  // Without a base name to compare against, trust only an explicit non-fork.
-  if (!base?.full_name) return head.fork !== false;
+  // Both names are needed to establish that the PR came from this repository.
+  if (!base?.full_name) return true;
   return head.full_name.toLowerCase() !== base.full_name.toLowerCase();
 }
 
@@ -32,6 +32,9 @@ function crossRepo(head: Repo, base: Repo): boolean {
 export function refusalReason(eventName: string | undefined, payload: Payload): string | null {
   if (eventName === 'pull_request_target') {
     return 'refusing to run on pull_request_target: it exposes secrets to pull requests from forks';
+  }
+  if (eventName?.startsWith('pull_request') && !payload.pull_request) {
+    return 'refusing to run: pull request repository metadata is missing';
   }
   if (payload.pull_request && crossRepo(payload.pull_request.head?.repo, payload.pull_request.base?.repo)) {
     return 'refusing to run for a pull request from a fork';

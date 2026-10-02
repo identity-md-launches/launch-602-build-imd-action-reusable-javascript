@@ -68,6 +68,25 @@ describe('refuses unsafe events before doing anything', () => {
       assert.match(result.stdout, /pull_request_target/);
       assert.equal(mock().requests.length, 0);
     });
+
+    it('refuses pull request events with missing provenance', async () => {
+      for (const payload of [{}, { pull_request: null }]) {
+        const key = throwawayKey();
+        const result = await runAction({
+          inputs: { action: 'job.open', input: INPUT, 'private-key': key, 'dry-run': 'false', 'api-url': mock().url },
+          event: { name: 'pull_request', payload },
+        });
+        assert.equal(result.code, 1);
+        assert.match(result.stdout, /repository metadata is missing/);
+        assertKeyNotLeaked(result, key);
+      }
+      const noFile = await runAction({
+        inputs: { action: 'job.open', input: INPUT, 'private-key': throwawayKey(), 'dry-run': 'false', 'api-url': mock().url },
+        env: { GITHUB_EVENT_NAME: 'pull_request' },
+      });
+      assert.equal(noFile.code, 1);
+      assert.equal(mock().requests.length, 0);
+    });
   });
 });
 
@@ -147,6 +166,51 @@ describe('live payment against the mock', () => {
       assert.equal(quote?.body.input.baseCommit, 'a'.repeat(40));
     });
   });
+
+  withMock({}, (mock) => {
+    it('refuses a GitHub rerun before creating another order or signing', async () => {
+      const key = throwawayKey();
+      const inputs = { action: 'job.open', input: INPUT, 'private-key': key, 'dry-run': 'false', 'api-url': mock().url };
+      const context = { GITHUB_REPOSITORY: 'owner/repo', GITHUB_RUN_ID: '1234', GITHUB_JOB: 'audit', GITHUB_SHA: 'a'.repeat(40) };
+      const first = await runAction({ inputs, env: { ...context, GITHUB_RUN_ATTEMPT: '1' } });
+      assert.equal(first.code, 0, first.stdout);
+      const count = mock().requests.length;
+      const second = await runAction({ inputs, env: { ...context, GITHUB_RUN_ATTEMPT: '2' } });
+      assert.equal(second.code, 1);
+      assert.match(second.stdout, /refusing to pay on a GitHub job rerun/);
+      assert.equal(mock().requests.length, count);
+      assert.equal(mock().payments.length, 1);
+      assertKeyNotLeaked(second, key);
+    });
+  });
+
+  withMock({ ledgerReadBarrier: 3 }, (mock) => {
+    it('uses an atomic wallet ledger across concurrent action processes', async () => {
+      const key = throwawayKey();
+      const inputs = { action: 'job.open', input: INPUT, 'private-key': key, 'dry-run': 'false', 'api-url': mock().url, 'max-imd-per-day': '1' };
+      const results = await Promise.all([1, 2, 3].map((n) => runAction({
+        inputs,
+        env: { GITHUB_REPOSITORY: 'owner/repo', GITHUB_RUN_ID: String(n), GITHUB_JOB: 'audit', GITHUB_RUN_ATTEMPT: '1' },
+      })));
+      assert.equal(results.filter((r) => r.code === 0).length, 2, results.map((r) => r.stdout).join('\n'));
+      assert.equal(results.filter((r) => r.code === 1).length, 1);
+      assert.equal(mock().payments.length, 2);
+      assert.equal(paymentAttempts(mock()).length, 2);
+      for (const result of results) assertKeyNotLeaked(result, key);
+    });
+  });
+
+  withMock({ tamperSubmit: (outcome) => { outcome.status = '$(touch /tmp/imd-summary-pwned)'; } }, (mock) => {
+    it('rejects a malformed API status instead of exporting it', async () => {
+      const result = await runAction({
+        inputs: { action: 'job.open', input: INPUT, 'private-key': throwawayKey(), 'dry-run': 'false', 'api-url': mock().url },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /invalid order status/);
+      assert.equal(result.outputs.status, undefined);
+      assert.equal(mock().payments.length, 1);
+    });
+  });
 });
 
 describe('refuses to pay', () => {
@@ -189,6 +253,15 @@ describe('refuses to pay', () => {
       opts: {},
       inputs: { 'max-imd': '0.4' },
       message: /above max-imd 0\.4 IMD/,
+    },
+    {
+      name: 'capability decimals changed to make 0.5 IMD look like 0.05 IMD',
+      opts: {
+        tamperCapability: (p) => { p.decimals = 19; },
+        tamperChallenge: (c) => { c.quote.payment.decimals = 19; },
+      },
+      inputs: { 'max-imd': '0.05', 'max-imd-per-day': '0.05' },
+      message: /invalid IMD token decimals/,
     },
     {
       name: 'above the per-day cap',

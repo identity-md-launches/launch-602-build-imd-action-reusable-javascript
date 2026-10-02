@@ -39,11 +39,17 @@ jobs:
           input: imd-input.json
           import-repo: true
           private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          spend-ledger-repo: ${{ vars.IMD_LEDGER_REPO }}
+          spend-ledger-token: ${{ secrets.IMD_LEDGER_TOKEN }}
           dry-run: ${{ !inputs.pay }}
           max-imd: '0.5'
           wait: true
 
       - name: Summary
+        env:
+          IMD_ORDER_ID: ${{ steps.imd.outputs.order-id }}
+          IMD_STATUS: ${{ steps.imd.outputs.status }}
+          IMD_JOB_URL: ${{ steps.imd.outputs.job-url }}
         run: |
-          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"
+          printf 'IMD order %s: %s\n' "$IMD_ORDER_ID" "$IMD_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$IMD_JOB_URL" >> "$GITHUB_STEP_SUMMARY"

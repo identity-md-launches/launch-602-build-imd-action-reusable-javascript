@@ -8,8 +8,8 @@ through [api.imd.fun](https://imd.fun/docs#paid), using x402 v2 with a Permit2 s
 EIP-712 quote approval. The server pays the gas.
 
 It runs as a **dry run by default**: it quotes the request and checks the payment challenge, but
-signs nothing. Real payment needs `dry-run: false`, a wallet key passed as a secret, and a quote
-that stays inside both spending caps.
+signs nothing. Real payment needs `dry-run: false`, a wallet key passed as a secret, a shared
+GitHub spending ledger, and a quote that stays inside both spending caps.
 
 ## Five-minute start
 
@@ -40,11 +40,19 @@ It prints the price, the evaluator's verdict, the order id and the verified chal
   cap. This is the only transaction you send yourself.
 - In your repository, add the key as the secret `IMD_PRIVATE_KEY` (Settings → Secrets and
   variables → Actions).
+- Create a GitHub repository for the spending ledger (for example `your-org/imd-spend-ledger`).
+  Every workflow using this wallet, including workflows in other repositories, must use **the
+  same** ledger repository. Add its `owner/repo` as the variable `IMD_LEDGER_REPO`. Add a
+  fine-grained GitHub token with **Contents: read and write** on that repository as the secret
+  `IMD_LEDGER_TOKEN`. The action writes one wallet ledger file there before each live signature.
 
 **3. Copy a workflow** from [`examples/workflows/`](examples/workflows) (reproduced below) into
 your repository's `.github/workflows/`. Replace `your-org/imd-action@<sha>` with this action's
 repository and a pinned commit. Run it once as a dry run. To pay, tick `pay` when you dispatch the audit, or set the
 repository variable `IMD_LIVE` to `true` for the label workflows.
+Use a dedicated ledger repository so these commits do not change the source repository being
+audited. A rerun of an already paid GitHub job is refused; inspect its original order, then
+start a new workflow run if you intend to buy another request.
 
 ## Example workflows
 
@@ -94,14 +102,20 @@ jobs:
           input: imd-input.json
           import-repo: true
           private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          spend-ledger-repo: ${{ vars.IMD_LEDGER_REPO }}
+          spend-ledger-token: ${{ secrets.IMD_LEDGER_TOKEN }}
           dry-run: ${{ !inputs.pay }}
           max-imd: '0.5'
           wait: true
 
       - name: Summary
+        env:
+          IMD_ORDER_ID: ${{ steps.imd.outputs.order-id }}
+          IMD_STATUS: ${{ steps.imd.outputs.status }}
+          IMD_JOB_URL: ${{ steps.imd.outputs.job-url }}
         run: |
-          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"
+          printf 'IMD order %s: %s\n' "$IMD_ORDER_ID" "$IMD_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$IMD_JOB_URL" >> "$GITHUB_STEP_SUMMARY"
 ```
 
 ### Adversarial review when a pull request is labelled `imd-review`
@@ -151,14 +165,20 @@ jobs:
           input: imd-input.json
           import-repo: true
           private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          spend-ledger-repo: ${{ vars.IMD_LEDGER_REPO }}
+          spend-ledger-token: ${{ secrets.IMD_LEDGER_TOKEN }}
           dry-run: ${{ vars.IMD_LIVE != 'true' }}
           max-imd: '0.5'
           max-imd-per-day: '2'
 
       - name: Summary
+        env:
+          IMD_ORDER_ID: ${{ steps.imd.outputs.order-id }}
+          IMD_STATUS: ${{ steps.imd.outputs.status }}
+          IMD_JOB_URL: ${{ steps.imd.outputs.job-url }}
         run: |
-          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"
+          printf 'IMD order %s: %s\n' "$IMD_ORDER_ID" "$IMD_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$IMD_JOB_URL" >> "$GITHUB_STEP_SUMMARY"
 ```
 
 ### Research report when an issue is labelled `imd-research`
@@ -207,14 +227,20 @@ jobs:
           action: job.open
           input: imd-input.json
           private-key: ${{ secrets.IMD_PRIVATE_KEY }}
+          spend-ledger-repo: ${{ vars.IMD_LEDGER_REPO }}
+          spend-ledger-token: ${{ secrets.IMD_LEDGER_TOKEN }}
           dry-run: ${{ vars.IMD_LIVE != 'true' }}
           max-imd: '0.5'
           max-imd-per-day: '2'
 
       - name: Summary
+        env:
+          IMD_ORDER_ID: ${{ steps.imd.outputs.order-id }}
+          IMD_STATUS: ${{ steps.imd.outputs.status }}
+          IMD_JOB_URL: ${{ steps.imd.outputs.job-url }}
         run: |
-          echo "IMD order ${{ steps.imd.outputs.order-id }}: ${{ steps.imd.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.imd.outputs.job-url }}" >> "$GITHUB_STEP_SUMMARY"
+          printf 'IMD order %s: %s\n' "$IMD_ORDER_ID" "$IMD_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$IMD_JOB_URL" >> "$GITHUB_STEP_SUMMARY"
 ```
 
 Untrusted text, such as titles and bodies, reaches the request only through `env:` and `jq --arg`.
@@ -230,7 +256,9 @@ commands or fields.
 | `private-key` | `''` | Wallet key. Pass it **only** as `${{ secrets.… }}`. Not needed for a dry run |
 | `dry-run` | `true` | `true`: quote and verify, never sign. `false`: pay if every check passes |
 | `max-imd` | `0.5` | Per-request cap in IMD |
-| `max-imd-per-day` | `1` | Cap on what this wallet paid in the last 24 hours, including this request |
+| `max-imd-per-day` | `1` | Cap on what this wallet paid or reserved in the last 24 hours, including this request |
+| `spend-ledger-repo` | (required for live payment) | Shared GitHub `owner/repo` that holds the wallet's atomic spending ledger |
+| `spend-ledger-token` | (required for live payment) | Secret GitHub token with Contents write on the ledger repository |
 | `wait` | `false` | Poll `GET /requests/{id}` until the status leaves `quoted`, `payment_pending` and `admission_pending` |
 | `wait-timeout` | `1800` | Seconds to keep polling |
 | `poll-interval` | `10` | Seconds between polls |
@@ -258,6 +286,7 @@ commands or fields.
 | `POST /requests/quote` with a fresh UUID `requestKey` and a random 32-byte bearer token | The action | free; the quote lasts 600 s |
 | `POST /requests/{id}/submit` with no body, which returns the 402 challenge | The action | free |
 | Verify the challenge and both caps | The action | **A dry run stops here** |
+| Reserve the quote in the shared wallet ledger using GitHub's conditional file update | The action, before signing | free; competing runs retry against the updated ledger |
 | Sign the Permit2 `PermitWitnessTransferFrom` and the `QuoteApproval` | The wallet key, in memory | none on its own |
 | Resubmit with `PAYMENT-SIGNATURE` and `{quoteSignature}` | The action | **0.5 IMD per action** |
 | Settle on chain: the x402 Permit2 proxy pulls exactly the quoted amount to `payTo` | IMD's server, which pays the gas because that is how it gets paid | gas, paid by IMD |
@@ -278,9 +307,14 @@ These are the guarantees and where each is enforced:
 - **Dry run is the default.** With `dry-run: true` no signature is made and no `PAYMENT-SIGNATURE`
   is sent. The end-to-end tests check both.
 - **Spending caps are checked before any signature.** `max-imd` is checked locally. `max-imd-per-day`
-  sums what the wallet paid in the last 24 hours from `GET /requests/paid-by/<wallet>`, because
-  CI runners keep no state between runs. If that history cannot be read, the action refuses to
-  pay. An order with no stated amount counts as one full price.
+  sums what the wallet paid in the last 24 hours from `GET /requests/paid-by/<wallet>` and
+  reservations in the shared GitHub ledger. The ledger update is conditional on its current
+  SHA: concurrent runs sharing a wallet and ledger cannot all spend the same remaining cap.
+  If history or the ledger cannot be read or updated, the action refuses to pay. A reservation
+  remains for 24 hours even if submission fails, so uncertain payments consume cap rather
+  than risk a second charge. An order with no stated amount counts as one full price.
+- **IMD has 18 decimal places.** The action pins this locally and refuses capabilities or a
+  quote that claim a different denomination.
 - **It refuses look-alike or changed payment terms.**
   [`verifyChallenge`](src/payment.ts) requires every one of these to hold:
   - the asset in the challenge, the quote and the capabilities is the pinned IMD token address;
@@ -294,12 +328,14 @@ These are the guarantees and where each is enforced:
   its spender is the x402 exact Permit2 proxy `0x402085c248EeA27D92E8b30b2C58ed07f9E20001`. The
   deadline ends at least 5 s before the quote expires. The witness is `{to: payTo, validAfter: 0}`.
 - **It refuses unsafe triggers.** It refuses `pull_request_target`, pull requests whose head
-  repository differs from the base (forks), and `workflow_run` events started by fork PRs.
+  repository differs from the base (forks), PR events without repository metadata, and
+  `workflow_run` events started by fork PRs. It also refuses live payment on a GitHub rerun.
 
 **Trust assumptions.** Payment buys *admission*, not a result (`terms.resultGuaranteed` is
 `false`). The `payTo` address and the price come from IMD's own capabilities endpoint. The token
 address is pinned in the code, but `payTo` cannot be pinned the same way. The per-day cap relies
-on IMD reporting the wallet's history honestly. The per-request cap and a small Permit2
+on IMD reporting the wallet's history honestly and on all uses of one wallet pointing to the
+same GitHub ledger with a working Contents API. The per-request cap and a small Permit2
 allowance do not depend on the server at all.
 
 ## Development
@@ -311,7 +347,8 @@ npm run build   # tsc + rollup -> dist/index.js (commit it)
 ```
 
 - `src/`: the action. Entry point `main.ts`, flow `run.ts`, challenge checks and payloads
-  `payment.ts`, EIP-712 `eip712.ts`, key handling `wallet.ts`, caps `spend.ts`, event guard
+  `payment.ts`, EIP-712 `eip712.ts`, key handling `wallet.ts`, caps `spend.ts`, shared ledger
+  `ledger.ts`, event guard
   `guard.ts`, inputs `config.ts`, runner I/O `gha.ts`.
 - `test/`: `node:test` suites. `helpers/mock-server.ts` is a local IMD API that verifies both
   signatures like the real one. Tests use fresh throwaway keys and never contact mainnet or

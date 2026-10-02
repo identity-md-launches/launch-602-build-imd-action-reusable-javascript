@@ -34,6 +34,12 @@ export interface MockOptions {
   noisyChecks?: number;
   /** History returned by GET /requests/paid-by/:address. */
   paidBy?: any[];
+  /** Edit capabilities (for a faulty or malicious API). */
+  tamperCapability?: (payment: any) => void;
+  /** Edit the signed submit outcome before it is sent. */
+  tamperSubmit?: (result: any) => void;
+  /** Hold the first N ledger reads until all have arrived, forcing a write race. */
+  ledgerReadBarrier?: number;
 }
 
 export interface Mock {
@@ -74,6 +80,11 @@ export async function startMock(opts: MockOptions = {}): Promise<Mock> {
   const requests: Recorded[] = [];
   const payments: Mock['payments'] = [];
   const orders = new Map<string, { token: string; action: string; input: any; challenge?: Challenge; status: string; polls: number }>();
+  const ledgerFiles = new Map<string, { sha: string; content: string }>();
+  let ledgerRevision = 0;
+  let ledgerReads = 0;
+  let releaseLedgerReads: (() => void) | undefined;
+  const ledgerReadGate = new Promise<void>((resolve) => { releaseLedgerReads = resolve; });
   let checks = 0;
   let base = '';
 
@@ -91,8 +102,27 @@ export async function startMock(opts: MockOptions = {}): Promise<Mock> {
     const token = /^Bearer ([0-9a-f]{64})$/.exec(req.headers.authorization ?? '')?.[1];
 
     try {
+      // Minimal GitHub Contents API: SHA is a compare-and-swap precondition.
+      if (/^\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/contents\/\.imd-spend-ledger\/[0-9a-fx]+\.json$/.test(path)) {
+        if (req.headers.authorization !== 'Bearer throwaway-ledger-token') return send(401, { message: 'Bad credentials' });
+        const file = ledgerFiles.get(path);
+        if (req.method === 'GET') {
+          if (opts.ledgerReadBarrier && ++ledgerReads <= opts.ledgerReadBarrier) {
+            if (ledgerReads === opts.ledgerReadBarrier) releaseLedgerReads?.();
+            await ledgerReadGate;
+          }
+          return file ? send(200, { sha: file.sha, content: file.content, encoding: 'base64' }) : send(404, { message: 'Not Found' });
+        }
+        if (req.method === 'PUT') {
+          if ((file?.sha ?? undefined) !== body?.sha) return send(409, { message: 'Conflict' });
+          const sha = (++ledgerRevision).toString(16).padStart(40, '0');
+          ledgerFiles.set(path, { sha, content: body.content });
+          return send(file ? 200 : 201, { content: { sha } });
+        }
+      }
       if (req.method === 'GET' && path === '/requests/capabilities') {
         const payment = { network: 'eip155:1', asset: IMD_TOKEN, amount: PRICE, payTo: PAY_TO, decimals: 18 };
+        opts.tamperCapability?.(payment);
         return send(200, {
           actions: ['job.open', 'job.continue', 'workflow.open'].map((action) => ({ action, version: '1', payment, quoteTtlSeconds: 600 })),
         });
@@ -171,7 +201,9 @@ export async function startMock(opts: MockOptions = {}): Promise<Mock> {
         if (approver !== payer) return send(400, { error: 'invalid_quote_approval' });
         payments.push({ payer, payment });
         order.status = 'payment_pending';
-        return send(202, { status: order.status, order: { id }, payment: null, admission: null });
+        const outcome = { status: order.status, order: { id }, payment: null, admission: null };
+        opts.tamperSubmit?.(outcome);
+        return send(202, outcome);
       }
       if (req.method === 'GET' && !m[2]) {
         order.polls++;

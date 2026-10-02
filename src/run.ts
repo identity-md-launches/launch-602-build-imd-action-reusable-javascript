@@ -5,14 +5,17 @@ import { ApiError, ImdApi } from './api.js';
 import { canonicalJson, sha256Hex } from './canonical.js';
 import { readConfig, type Config } from './config.js';
 import { log, setOutput } from './gha.js';
+import { getBooleanInput } from './gha.js';
 import { readEventPayload, refusalReason } from './guard.js';
 import { EXPERIMENTAL } from './help.js';
+import { reserveDailySpend } from './ledger.js';
 import {
   buildAuthorization,
   buildPayment,
   capabilityFor,
   encodePaymentHeader,
   formatUnits,
+  IMD_DECIMALS,
   parseUnits,
   permit2TypedData,
   permitDeadline,
@@ -26,6 +29,20 @@ import { createWallet, type Wallet } from './wallet.js';
 
 export const EXPLORER_JOB_URL = 'https://explorer.imd.fun/jobs/';
 const PENDING = new Set(['quoted', 'payment_pending', 'admission_pending']);
+const STATUSES = new Set(['quoted', 'payment_pending', 'admission_pending', 'admitted', 'payment_failed', 'expired']);
+
+function checkedStatus(value: unknown): string {
+  if (typeof value !== 'string' || !STATUSES.has(value)) throw new Error('API returned an invalid order status');
+  return value;
+}
+
+function runKey(): string {
+  const repo = process.env.GITHUB_REPOSITORY;
+  const run = process.env.GITHUB_RUN_ID;
+  const job = process.env.GITHUB_JOB;
+  if (!repo || !run || !job) return '';
+  return `${repo}/${run}/${job}/${process.env.GITHUB_ACTION ?? ''}`;
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -85,9 +102,10 @@ function admissionResult(status: any): any {
 }
 
 function setResultOutputs(status: any): string {
-  const state = String(status?.status ?? 'unknown');
+  const state = checkedStatus(status?.status);
   const result = admissionResult(status);
   const jobId = typeof result?.jobId === 'string' ? result.jobId : '';
+  if (jobId && !/^[A-Za-z0-9_-]+$/.test(jobId)) throw new Error('API returned an invalid job id');
   setOutput('status', state);
   setOutput('job-id', jobId);
   setOutput('job-url', jobId ? `${EXPLORER_JOB_URL}${encodeURIComponent(jobId)}` : '');
@@ -115,14 +133,14 @@ async function pay(api: ImdApi, wallet: Wallet, orderId: string, challenge: Chal
 async function poll(api: ImdApi, orderId: string, initial: any, cfg: Config): Promise<any> {
   let status = initial;
   const deadline = Date.now() + cfg.waitTimeoutSeconds * 1000;
-  while (PENDING.has(status?.status)) {
+  while (PENDING.has(checkedStatus(status?.status))) {
     if (Date.now() >= deadline) {
       log.warning(`Stopped waiting after ${cfg.waitTimeoutSeconds}s; order is still ${status?.status}.`);
       break;
     }
     await sleep(cfg.pollIntervalSeconds * 1000);
     status = await api.json('GET', `/requests/${orderId}`);
-    log.info(`Order status: ${status?.status}`);
+    log.info(`Order status: ${checkedStatus(status?.status)}`);
   }
   return status;
 }
@@ -135,6 +153,17 @@ export async function run(): Promise<void> {
   const reason = refusalReason(process.env.GITHUB_EVENT_NAME, payload);
   if (reason) throw new Error(reason);
 
+  // GitHub increments this for reruns. A failed poll must not turn into a
+  // second paid order; start a new workflow run to authorize a new payment.
+  const attempt = process.env.GITHUB_RUN_ATTEMPT;
+  if (process.env.GITHUB_ACTIONS === 'true' && !attempt && !getBooleanInput('dry-run', true)) {
+    throw new Error('refusing to pay without GITHUB_RUN_ATTEMPT');
+  }
+  if (attempt && !getBooleanInput('dry-run', true)) {
+    if (!/^[1-9][0-9]*$/.test(attempt)) throw new Error('invalid GITHUB_RUN_ATTEMPT');
+    if (BigInt(attempt) > 1n) throw new Error('refusing to pay on a GitHub job rerun; inspect the original order before starting a new run');
+  }
+
   const cfg = readConfig();
   const wallet = cfg.privateKey ? createWallet(cfg.privateKey) : null;
   cfg.privateKey = '';
@@ -143,7 +172,7 @@ export async function run(): Promise<void> {
 
   const api = new ImdApi(cfg.apiUrl);
   const capability = capabilityFor(await api.json('GET', '/requests/capabilities'), cfg.action);
-  const decimals = capability.payment.decimals;
+  const decimals = IMD_DECIMALS;
   const perRequestCap = parseUnits(cfg.maxImd, decimals);
   const dailyCap = parseUnits(cfg.maxImdPerDay, decimals);
   log.info(`Price: ${formatUnits(BigInt(capability.payment.amount), decimals)} IMD per ${cfg.action}`);
@@ -172,10 +201,10 @@ export async function run(): Promise<void> {
     nowSeconds: Math.floor(Date.now() / 1000),
   });
   checkPerRequestCap(amount, perRequestCap, decimals);
-  if (wallet) {
+  if (wallet && cfg.dryRun) {
     const spent = await checkDailyCap(api, { address: wallet.address, amount, cap: dailyCap, decimals, orderId });
     log.info(`Spent by this wallet in the last 24h: ${formatUnits(spent, decimals)} IMD (cap ${cfg.maxImdPerDay}).`);
-  } else {
+  } else if (!wallet) {
     log.info('No private-key given: skipping the per-day check (it needs the wallet address).');
   }
   log.info(
@@ -192,8 +221,21 @@ export async function run(): Promise<void> {
   }
   if (!wallet) throw new Error('private-key is required when dry-run is false');
 
+  const spent = await reserveDailySpend(api, {
+    address: wallet.address,
+    amount,
+    cap: dailyCap,
+    decimals,
+    orderId,
+    runKey: runKey(),
+    repo: cfg.spendLedgerRepo,
+    token: cfg.spendLedgerToken,
+  });
+  cfg.spendLedgerToken = '';
+  log.info(`Reserved payment against the shared 24h ledger; prior spend and reservations: ${formatUnits(spent, decimals)} IMD.`);
+
   let status = await pay(api, wallet, orderId, challenge);
-  log.info(`Submitted payment; order status: ${status?.status}`);
+  log.info(`Submitted payment; order status: ${checkedStatus(status?.status)}`);
   if (cfg.wait) status = await poll(api, orderId, status, cfg);
 
   const state = setResultOutputs(status);

@@ -255,119 +255,6 @@ function sha256Hex(text) {
     return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
-// Reads and validates the action inputs. Values are never echoed: errors name
-// the input, not its content.
-const ACTIONS = [
-    'job.open',
-    'job.continue',
-    'launch.open',
-    'oracle.request',
-    'workflow.open',
-    'schedule.create',
-    'schedule.topup',
-];
-function positiveNumber(name, fallback) {
-    const value = Number(getInput(name, fallback));
-    if (!Number.isFinite(value) || value <= 0)
-        throw new Error(`input ${name} must be a positive number`);
-    return value;
-}
-/** `input` is inline JSON when it starts with "{", otherwise a path to a JSON file. */
-function loadInput(raw, workspace) {
-    if (!raw)
-        throw new Error('input is required (inline JSON or a path to a JSON file)');
-    let text = raw;
-    if (!raw.startsWith('{')) {
-        const path = isAbsolute(raw) ? raw : resolve(workspace, raw);
-        try {
-            text = readFileSync(path, 'utf8');
-        }
-        catch {
-            throw new Error('input is neither inline JSON nor a readable file path');
-        }
-    }
-    let parsed;
-    try {
-        parsed = JSON.parse(text);
-    }
-    catch {
-        throw new Error('input is not valid JSON');
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
-        throw new Error('input must be a JSON object');
-    return parsed;
-}
-function readConfig() {
-    // The key is taken (and removed from the environment) first so that no later
-    // error path can include it.
-    const privateKey = takeSecretInput('private-key');
-    const action = getInput('action');
-    if (!ACTIONS.includes(action)) {
-        throw new Error(`input action must be one of: ${ACTIONS.join(', ')}`);
-    }
-    const dryRun = getBooleanInput('dry-run', true);
-    if (!dryRun && !privateKey)
-        throw new Error('private-key is required when dry-run is false');
-    const importKind = getInput('import-kind', 'code');
-    if (!['code', 'contracts', 'site'].includes(importKind))
-        throw new Error('input import-kind must be code, contracts or site');
-    return {
-        action,
-        input: loadInput(getInput('input'), process.env.GITHUB_WORKSPACE || process.cwd()),
-        privateKey,
-        maxImd: getInput('max-imd', '0.5'),
-        maxImdPerDay: getInput('max-imd-per-day', '1'),
-        dryRun,
-        wait: getBooleanInput('wait', false),
-        waitTimeoutSeconds: positiveNumber('wait-timeout', '1800'),
-        pollIntervalSeconds: positiveNumber('poll-interval', '10'),
-        importRepo: getBooleanInput('import-repo', false),
-        importKind,
-        check: getBooleanInput('check', true),
-        apiUrl: checkApiUrl(getInput('api-url', DEFAULT_API_URL)),
-    };
-}
-
-// Refuse to run in contexts where untrusted code or untrusted people could
-// steer a run that holds the wallet key.
-function readEventPayload() {
-    const path = process.env.GITHUB_EVENT_PATH;
-    if (!path)
-        return {};
-    try {
-        return JSON.parse(readFileSync(path, 'utf8'));
-    }
-    catch {
-        // An unreadable payload under GitHub Actions is suspicious; fail closed.
-        throw new Error('could not read the GitHub event payload');
-    }
-}
-function crossRepo(head, base) {
-    // A deleted head repository (null) is treated as a fork.
-    if (!head || !head.full_name)
-        return true;
-    // Without a base name to compare against, trust only an explicit non-fork.
-    if (!base?.full_name)
-        return head.fork !== false;
-    return head.full_name.toLowerCase() !== base.full_name.toLowerCase();
-}
-/** Returns a reason to refuse, or null when the event is safe to run from. */
-function refusalReason(eventName, payload) {
-    if (eventName === 'pull_request_target') {
-        return 'refusing to run on pull_request_target: it exposes secrets to pull requests from forks';
-    }
-    if (payload.pull_request && crossRepo(payload.pull_request.head?.repo, payload.pull_request.base?.repo)) {
-        return 'refusing to run for a pull request from a fork';
-    }
-    if (payload.workflow_run && payload.workflow_run.event?.startsWith('pull_request')) {
-        const base = payload.workflow_run.repository ?? payload.repository;
-        if (crossRepo(payload.workflow_run.head_repository, base)) {
-            return 'refusing to run from a workflow_run triggered by a pull request from a fork';
-        }
-    }
-    return null;
-}
-
 /**
  * Internal helpers for u64. BigUint64Array is too slow as per 2025, so we implement it using Uint32Array.
  * @todo re-check https://issues.chromium.org/issues/42212588
@@ -868,6 +755,8 @@ function sameAddress(a, b) {
 // before a signature is produced.
 /** IMD on Ethereum mainnet. Pinned: a challenge for any other token is refused. */
 const IMD_TOKEN = '0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7';
+/** IMD uses 18 decimal places; pricing metadata must not redefine this unit. */
+const IMD_DECIMALS = 18;
 const NETWORK = 'eip155:1';
 const CHAIN_ID = 1;
 const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
@@ -906,8 +795,8 @@ function capabilityFor(capabilities, action) {
     if (!p || p.network !== NETWORK || !sameAddress(p.asset, IMD_TOKEN) || !isAddress(p.payTo) || !UINT_RE.test(p.amount)) {
         refuse('capabilities do not describe an IMD payment on Ethereum mainnet');
     }
-    if (!Number.isInteger(p.decimals) || p.decimals < 0 || p.decimals > 36)
-        refuse('capabilities list invalid token decimals');
+    if (p.decimals !== IMD_DECIMALS)
+        refuse('capabilities list invalid IMD token decimals');
     return entry;
 }
 /**
@@ -1085,12 +974,12 @@ function checkPerRequestCap(amount, cap, decimals) {
     }
 }
 /** Sum what a wallet spent in the last 24 hours, from its paid-by history. */
-function spentInLastDay(history, now, excludeOrderId, fallbackAmount) {
+function spentInLastDay(history, now, excludeOrderId, fallbackAmount, excludeOrderIds = new Set()) {
     if (!history || !Array.isArray(history.orders))
         throw new Error('paid-by history has no orders list');
     let total = 0n;
     for (const order of history.orders) {
-        if (!order || order.orderId === excludeOrderId || NOT_SPENT.has(order.status))
+        if (!order || order.orderId === excludeOrderId || excludeOrderIds.has(order.orderId) || NOT_SPENT.has(order.status))
             continue;
         const when = Date.parse(order.paidAt ?? order.createdAt ?? '');
         // An undated entry counts: unknown is treated as spent today.
@@ -1107,12 +996,242 @@ async function checkDailyCap(api, opts) {
     if (res.status !== 200) {
         throw new PaymentRefused(`refusing to pay: could not read today's spending (paid-by returned ${res.status})`);
     }
-    const spent = spentInLastDay(res.body, opts.now ?? Date.now(), opts.orderId, opts.amount);
+    const spent = spentInLastDay(res.body, opts.now ?? Date.now(), opts.orderId, opts.amount, opts.excludeOrderIds);
     if (spent + opts.amount > opts.cap) {
         const f = (v) => formatUnits(v, opts.decimals);
         throw new PaymentRefused(`refusing to pay: ${f(spent)} IMD spent in the last 24h + ${f(opts.amount)} IMD exceeds max-imd-per-day ${f(opts.cap)} IMD`);
     }
     return spent;
+}
+
+// A GitHub Contents API compare-and-swap ledger shared by every CI run using
+// one wallet. Reserving before signing closes the paid-by snapshot race.
+// Reservations remain for 24 hours even if submission fails: this fails safe.
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const SHA_RE = /^[0-9a-f]{40}$/i;
+const MAX_ATTEMPTS = 20;
+function validateLedgerRepo(repo) {
+    if (!REPO_RE.test(repo))
+        throw new Error('spend-ledger-repo must be a GitHub owner/repo');
+    return repo;
+}
+function parseLedger(data) {
+    if (!SHA_RE.test(data?.sha ?? '') || data?.encoding !== 'base64' || typeof data.content !== 'string') {
+        throw new PaymentRefused('refusing to pay: spend ledger response is malformed');
+    }
+    let ledger;
+    try {
+        ledger = JSON.parse(Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8'));
+    }
+    catch {
+        throw new PaymentRefused('refusing to pay: spend ledger is not valid JSON');
+    }
+    if (ledger?.version !== 1 || !Array.isArray(ledger.reservations)) {
+        throw new PaymentRefused('refusing to pay: spend ledger has an unsupported format');
+    }
+    for (const r of ledger.reservations) {
+        if (typeof r?.id !== 'string' || typeof r.orderId !== 'string' || typeof r.runKey !== 'string' ||
+            !Number.isSafeInteger(r.at) || typeof r.amount !== 'string' || !UINT_RE.test(r.amount))
+            throw new PaymentRefused('refusing to pay: spend ledger contains an invalid reservation');
+    }
+    return ledger;
+}
+/** Reserve one quote in a wallet ledger using an atomic GitHub file update. */
+async function reserveDailySpend(api, opts) {
+    const base = checkApiUrl(process.env.GITHUB_API_URL || 'https://api.github.com');
+    const repo = validateLedgerRepo(opts.repo);
+    const path = `/repos/${repo}/contents/.imd-spend-ledger/${opts.address.toLowerCase()}.json`;
+    const url = `${base}${path}`;
+    const headers = {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${opts.token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+    };
+    const id = randomUUID();
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const now = Date.now();
+        const get = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+        let sha;
+        let ledger = { version: 1, reservations: [] };
+        if (get.status === 200) {
+            const data = (await get.json());
+            ledger = parseLedger(data);
+            sha = data.sha;
+        }
+        else if (get.status !== 404) {
+            throw new PaymentRefused(`refusing to pay: spend ledger read returned ${get.status}`);
+        }
+        const active = ledger.reservations.filter((r) => now - r.at < DAY_MS);
+        if (active.some((r) => r.id === id)) {
+            return active.reduce((sum, r) => sum + BigInt(r.amount), 0n) - opts.amount;
+        }
+        if (opts.runKey && active.some((r) => r.runKey === opts.runKey)) {
+            throw new PaymentRefused('refusing to pay: this GitHub job already reserved a payment');
+        }
+        const reserved = active.reduce((sum, r) => sum + BigInt(r.amount), 0n);
+        const spent = await checkDailyCap(api, {
+            address: opts.address,
+            amount: reserved + opts.amount,
+            cap: opts.cap,
+            decimals: opts.decimals,
+            orderId: opts.orderId,
+            now,
+            excludeOrderIds: new Set(active.map((r) => r.orderId)),
+        });
+        const next = {
+            version: 1,
+            reservations: [...active, { id, orderId: opts.orderId, runKey: opts.runKey, at: now, amount: opts.amount.toString() }],
+        };
+        const body = {
+            message: 'Reserve IMD wallet spend',
+            content: Buffer.from(JSON.stringify(next)).toString('base64'),
+        };
+        if (sha)
+            body.sha = sha;
+        let put;
+        try {
+            put = await fetch(url, {
+                method: 'PUT',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(20_000),
+            });
+        }
+        catch {
+            continue; // The write may have committed; the stable id is checked on the next read.
+        }
+        if (put.status === 200 || put.status === 201)
+            return spent + reserved;
+        if (put.status === 409 || put.status === 422)
+            continue; // Lost the compare-and-swap; re-read both ledgers.
+        throw new PaymentRefused(`refusing to pay: spend ledger update returned ${put.status}`);
+    }
+    throw new PaymentRefused(`refusing to pay: could not reserve the daily cap after ${MAX_ATTEMPTS} attempts`);
+}
+
+// Reads and validates the action inputs. Values are never echoed: errors name
+// the input, not its content.
+const ACTIONS = [
+    'job.open',
+    'job.continue',
+    'launch.open',
+    'oracle.request',
+    'workflow.open',
+    'schedule.create',
+    'schedule.topup',
+];
+function positiveNumber(name, fallback) {
+    const value = Number(getInput(name, fallback));
+    if (!Number.isFinite(value) || value <= 0)
+        throw new Error(`input ${name} must be a positive number`);
+    return value;
+}
+/** `input` is inline JSON when it starts with "{", otherwise a path to a JSON file. */
+function loadInput(raw, workspace) {
+    if (!raw)
+        throw new Error('input is required (inline JSON or a path to a JSON file)');
+    let text = raw;
+    if (!raw.startsWith('{')) {
+        const path = isAbsolute(raw) ? raw : resolve(workspace, raw);
+        try {
+            text = readFileSync(path, 'utf8');
+        }
+        catch {
+            throw new Error('input is neither inline JSON nor a readable file path');
+        }
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        throw new Error('input is not valid JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error('input must be a JSON object');
+    return parsed;
+}
+function readConfig() {
+    // The key is taken (and removed from the environment) first so that no later
+    // error path can include it.
+    const privateKey = takeSecretInput('private-key');
+    const spendLedgerToken = takeSecretInput('spend-ledger-token');
+    const action = getInput('action');
+    if (!ACTIONS.includes(action)) {
+        throw new Error(`input action must be one of: ${ACTIONS.join(', ')}`);
+    }
+    const dryRun = getBooleanInput('dry-run', true);
+    if (!dryRun && !privateKey)
+        throw new Error('private-key is required when dry-run is false');
+    const spendLedgerRepo = getInput('spend-ledger-repo');
+    if (!dryRun && (!spendLedgerToken || !spendLedgerRepo)) {
+        throw new Error('spend-ledger-repo and spend-ledger-token are required when dry-run is false');
+    }
+    if (spendLedgerRepo)
+        validateLedgerRepo(spendLedgerRepo);
+    const importKind = getInput('import-kind', 'code');
+    if (!['code', 'contracts', 'site'].includes(importKind))
+        throw new Error('input import-kind must be code, contracts or site');
+    return {
+        action,
+        input: loadInput(getInput('input'), process.env.GITHUB_WORKSPACE || process.cwd()),
+        privateKey,
+        maxImd: getInput('max-imd', '0.5'),
+        maxImdPerDay: getInput('max-imd-per-day', '1'),
+        dryRun,
+        wait: getBooleanInput('wait', false),
+        waitTimeoutSeconds: positiveNumber('wait-timeout', '1800'),
+        pollIntervalSeconds: positiveNumber('poll-interval', '10'),
+        importRepo: getBooleanInput('import-repo', false),
+        importKind,
+        check: getBooleanInput('check', true),
+        apiUrl: checkApiUrl(getInput('api-url', DEFAULT_API_URL)),
+        spendLedgerRepo,
+        spendLedgerToken,
+    };
+}
+
+// Refuse to run in contexts where untrusted code or untrusted people could
+// steer a run that holds the wallet key.
+function readEventPayload() {
+    const path = process.env.GITHUB_EVENT_PATH;
+    if (!path)
+        return {};
+    try {
+        return JSON.parse(readFileSync(path, 'utf8'));
+    }
+    catch {
+        // An unreadable payload under GitHub Actions is suspicious; fail closed.
+        throw new Error('could not read the GitHub event payload');
+    }
+}
+function crossRepo(head, base) {
+    // A deleted head repository (null) is treated as a fork.
+    if (!head || !head.full_name)
+        return true;
+    // Both names are needed to establish that the PR came from this repository.
+    if (!base?.full_name)
+        return true;
+    return head.full_name.toLowerCase() !== base.full_name.toLowerCase();
+}
+/** Returns a reason to refuse, or null when the event is safe to run from. */
+function refusalReason(eventName, payload) {
+    if (eventName === 'pull_request_target') {
+        return 'refusing to run on pull_request_target: it exposes secrets to pull requests from forks';
+    }
+    if (eventName?.startsWith('pull_request') && !payload.pull_request) {
+        return 'refusing to run: pull request repository metadata is missing';
+    }
+    if (payload.pull_request && crossRepo(payload.pull_request.head?.repo, payload.pull_request.base?.repo)) {
+        return 'refusing to run for a pull request from a fork';
+    }
+    if (payload.workflow_run && payload.workflow_run.event?.startsWith('pull_request')) {
+        const base = payload.workflow_run.repository ?? payload.repository;
+        if (crossRepo(payload.workflow_run.head_repository, base)) {
+            return 'refusing to run from a workflow_run triggered by a pull request from a fork';
+        }
+    }
+    return null;
 }
 
 /**
@@ -3947,6 +4066,20 @@ function createWallet(privateKey) {
 // challenge -> verify + caps -> [stop here on dry run] -> sign -> submit -> poll.
 const EXPLORER_JOB_URL = 'https://explorer.imd.fun/jobs/';
 const PENDING = new Set(['quoted', 'payment_pending', 'admission_pending']);
+const STATUSES = new Set(['quoted', 'payment_pending', 'admission_pending', 'admitted', 'payment_failed', 'expired']);
+function checkedStatus(value) {
+    if (typeof value !== 'string' || !STATUSES.has(value))
+        throw new Error('API returned an invalid order status');
+    return value;
+}
+function runKey() {
+    const repo = process.env.GITHUB_REPOSITORY;
+    const run = process.env.GITHUB_RUN_ID;
+    const job = process.env.GITHUB_JOB;
+    if (!repo || !run || !job)
+        return '';
+    return `${repo}/${run}/${job}/${process.env.GITHUB_ACTION ?? ''}`;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** The public GitHub repository and branch this run is for. */
 function repoContext(payload) {
@@ -4002,9 +4135,11 @@ function admissionResult(status) {
     return status?.admission?.result ?? null;
 }
 function setResultOutputs(status) {
-    const state = String(status?.status ?? 'unknown');
+    const state = checkedStatus(status?.status);
     const result = admissionResult(status);
     const jobId = typeof result?.jobId === 'string' ? result.jobId : '';
+    if (jobId && !/^[A-Za-z0-9_-]+$/.test(jobId))
+        throw new Error('API returned an invalid job id');
     setOutput('status', state);
     setOutput('job-id', jobId);
     setOutput('job-url', jobId ? `${EXPLORER_JOB_URL}${encodeURIComponent(jobId)}` : '');
@@ -4032,14 +4167,14 @@ async function pay(api, wallet, orderId, challenge) {
 async function poll(api, orderId, initial, cfg) {
     let status = initial;
     const deadline = Date.now() + cfg.waitTimeoutSeconds * 1000;
-    while (PENDING.has(status?.status)) {
+    while (PENDING.has(checkedStatus(status?.status))) {
         if (Date.now() >= deadline) {
             log.warning(`Stopped waiting after ${cfg.waitTimeoutSeconds}s; order is still ${status?.status}.`);
             break;
         }
         await sleep(cfg.pollIntervalSeconds * 1000);
         status = await api.json('GET', `/requests/${orderId}`);
-        log.info(`Order status: ${status?.status}`);
+        log.info(`Order status: ${checkedStatus(status?.status)}`);
     }
     return status;
 }
@@ -4050,6 +4185,18 @@ async function run() {
     const reason = refusalReason(process.env.GITHUB_EVENT_NAME, payload);
     if (reason)
         throw new Error(reason);
+    // GitHub increments this for reruns. A failed poll must not turn into a
+    // second paid order; start a new workflow run to authorize a new payment.
+    const attempt = process.env.GITHUB_RUN_ATTEMPT;
+    if (process.env.GITHUB_ACTIONS === 'true' && !attempt && !getBooleanInput('dry-run', true)) {
+        throw new Error('refusing to pay without GITHUB_RUN_ATTEMPT');
+    }
+    if (attempt && !getBooleanInput('dry-run', true)) {
+        if (!/^[1-9][0-9]*$/.test(attempt))
+            throw new Error('invalid GITHUB_RUN_ATTEMPT');
+        if (BigInt(attempt) > 1n)
+            throw new Error('refusing to pay on a GitHub job rerun; inspect the original order before starting a new run');
+    }
     const cfg = readConfig();
     const wallet = cfg.privateKey ? createWallet(cfg.privateKey) : null;
     cfg.privateKey = '';
@@ -4058,7 +4205,7 @@ async function run() {
     log.info(cfg.dryRun ? 'Dry run: nothing will be signed or paid.' : 'Live run: payment will be signed if every check passes.');
     const api = new ImdApi(cfg.apiUrl);
     const capability = capabilityFor(await api.json('GET', '/requests/capabilities'), cfg.action);
-    const decimals = capability.payment.decimals;
+    const decimals = IMD_DECIMALS;
     const perRequestCap = parseUnits(cfg.maxImd, decimals);
     const dailyCap = parseUnits(cfg.maxImdPerDay, decimals);
     log.info(`Price: ${formatUnits(BigInt(capability.payment.amount), decimals)} IMD per ${cfg.action}`);
@@ -4087,11 +4234,11 @@ async function run() {
         nowSeconds: Math.floor(Date.now() / 1000),
     });
     checkPerRequestCap(amount, perRequestCap, decimals);
-    if (wallet) {
+    if (wallet && cfg.dryRun) {
         const spent = await checkDailyCap(api, { address: wallet.address, amount, cap: dailyCap, decimals, orderId });
         log.info(`Spent by this wallet in the last 24h: ${formatUnits(spent, decimals)} IMD (cap ${cfg.maxImdPerDay}).`);
     }
-    else {
+    else if (!wallet) {
         log.info('No private-key given: skipping the per-day check (it needs the wallet address).');
     }
     log.info(`Challenge verified: ${formatUnits(amount, decimals)} IMD to ${challenge.quote.payment.payTo}, ` +
@@ -4105,8 +4252,20 @@ async function run() {
     }
     if (!wallet)
         throw new Error('private-key is required when dry-run is false');
+    const spent = await reserveDailySpend(api, {
+        address: wallet.address,
+        amount,
+        cap: dailyCap,
+        decimals,
+        orderId,
+        runKey: runKey(),
+        repo: cfg.spendLedgerRepo,
+        token: cfg.spendLedgerToken,
+    });
+    cfg.spendLedgerToken = '';
+    log.info(`Reserved payment against the shared 24h ledger; prior spend and reservations: ${formatUnits(spent, decimals)} IMD.`);
     let status = await pay(api, wallet, orderId, challenge);
-    log.info(`Submitted payment; order status: ${status?.status}`);
+    log.info(`Submitted payment; order status: ${checkedStatus(status?.status)}`);
     if (cfg.wait)
         status = await poll(api, orderId, status, cfg);
     const state = setResultOutputs(status);

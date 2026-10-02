@@ -22,6 +22,12 @@ describe('refusalReason', () => {
     assert.ok(refusalReason('pull_request', pr(null)));
   });
 
+  it('refuses when PR metadata or either repository name is missing', () => {
+    assert.ok(refusalReason('pull_request', {}));
+    assert.ok(refusalReason('pull_request', { pull_request: undefined }));
+    assert.ok(refusalReason('pull_request', pr(repo('owner/repo'), null)));
+  });
+
   it('refuses review events on fork pull requests', () => {
     assert.ok(refusalReason('pull_request_review', pr(repo('attacker/repo', true))));
   });

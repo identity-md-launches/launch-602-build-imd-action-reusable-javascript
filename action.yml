@@ -27,9 +27,15 @@ inputs:
     required: false
     default: '0.5'
   max-imd-per-day:
-    description: 'Cap on IMD this wallet paid in the last 24 hours (read from GET /requests/paid-by), including this request.'
+    description: 'Cap on IMD spent or reserved by this wallet in the last 24 hours, including this request.'
     required: false
     default: '1'
+  spend-ledger-repo:
+    description: 'GitHub owner/repo for the atomic wallet spending ledger. All repositories using one wallet must share it. Required for live payment.'
+    required: false
+  spend-ledger-token:
+    description: 'Secret GitHub token with Contents write on spend-ledger-repo. Required for live payment.'
+    required: false
   wait:
     description: 'Poll the order until it leaves quoted, payment_pending and admission_pending.'
     required: false

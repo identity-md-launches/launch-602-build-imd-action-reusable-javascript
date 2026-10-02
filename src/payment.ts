@@ -8,6 +8,8 @@ import { HEX32_RE, UINT_RE, isAddress, sameAddress, toChecksumAddress } from './
 
 /** IMD on Ethereum mainnet. Pinned: a challenge for any other token is refused. */
 export const IMD_TOKEN = '0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7';
+/** IMD uses 18 decimal places; pricing metadata must not redefine this unit. */
+export const IMD_DECIMALS = 18;
 export const NETWORK = 'eip155:1';
 export const CHAIN_ID = 1;
 export const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
@@ -108,7 +110,7 @@ export function capabilityFor(capabilities: any, action: string): Capability {
   if (!p || p.network !== NETWORK || !sameAddress(p.asset, IMD_TOKEN) || !isAddress(p.payTo) || !UINT_RE.test(p.amount)) {
     refuse('capabilities do not describe an IMD payment on Ethereum mainnet');
   }
-  if (!Number.isInteger(p.decimals) || p.decimals < 0 || p.decimals > 36) refuse('capabilities list invalid token decimals');
+  if (p.decimals !== IMD_DECIMALS) refuse('capabilities list invalid IMD token decimals');
   return entry as Capability;
 }
 

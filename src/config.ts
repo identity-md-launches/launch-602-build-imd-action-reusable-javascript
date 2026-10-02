@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { DEFAULT_API_URL, checkApiUrl } from './api.js';
 import { getBooleanInput, getInput, takeSecretInput } from './gha.js';
+import { validateLedgerRepo } from './ledger.js';
 
 export const ACTIONS = [
   'job.open',
@@ -29,6 +30,8 @@ export interface Config {
   importKind: string;
   check: boolean;
   apiUrl: string;
+  spendLedgerRepo: string;
+  spendLedgerToken: string;
 }
 
 function positiveNumber(name: string, fallback: string): number {
@@ -63,12 +66,18 @@ export function readConfig(): Config {
   // The key is taken (and removed from the environment) first so that no later
   // error path can include it.
   const privateKey = takeSecretInput('private-key');
+  const spendLedgerToken = takeSecretInput('spend-ledger-token');
   const action = getInput('action');
   if (!(ACTIONS as readonly string[]).includes(action)) {
     throw new Error(`input action must be one of: ${ACTIONS.join(', ')}`);
   }
   const dryRun = getBooleanInput('dry-run', true);
   if (!dryRun && !privateKey) throw new Error('private-key is required when dry-run is false');
+  const spendLedgerRepo = getInput('spend-ledger-repo');
+  if (!dryRun && (!spendLedgerToken || !spendLedgerRepo)) {
+    throw new Error('spend-ledger-repo and spend-ledger-token are required when dry-run is false');
+  }
+  if (spendLedgerRepo) validateLedgerRepo(spendLedgerRepo);
   const importKind = getInput('import-kind', 'code');
   if (!['code', 'contracts', 'site'].includes(importKind)) throw new Error('input import-kind must be code, contracts or site');
   return {
@@ -85,5 +94,7 @@ export function readConfig(): Config {
     importKind,
     check: getBooleanInput('check', true),
     apiUrl: checkApiUrl(getInput('api-url', DEFAULT_API_URL)),
+    spendLedgerRepo,
+    spendLedgerToken,
   };
 }

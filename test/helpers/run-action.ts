@@ -36,11 +36,17 @@ export async function runAction(opts: {
   event?: { name: string; payload: unknown };
   env?: Record<string, string>;
   args?: string[];
+  withLedger?: boolean;
 }): Promise<RunResult> {
   const dir = mkdtempSync(join(tmpdir(), 'imd-action-test-'));
   const outputFile = join(dir, 'output');
   writeFileSync(outputFile, '');
   const env: Record<string, string> = { PATH: process.env.PATH ?? '', GITHUB_OUTPUT: outputFile, GITHUB_WORKSPACE: dir };
+  if (opts.inputs['dry-run'] === 'false' && opts.inputs['api-url']?.startsWith('http://127.0.0.1') && opts.withLedger !== false) {
+    env.GITHUB_API_URL = opts.inputs['api-url'];
+    env['INPUT_SPEND-LEDGER-REPO'] = 'owner/ledger';
+    env['INPUT_SPEND-LEDGER-TOKEN'] = 'throwaway-ledger-token';
+  }
   if (opts.event) {
     const eventPath = join(dir, 'event.json');
     writeFileSync(eventPath, JSON.stringify(opts.event.payload));

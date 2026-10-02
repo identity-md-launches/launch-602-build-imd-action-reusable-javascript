@@ -21,11 +21,17 @@ export function checkPerRequestCap(amount: bigint, cap: bigint, decimals: number
 }
 
 /** Sum what a wallet spent in the last 24 hours, from its paid-by history. */
-export function spentInLastDay(history: any, now: number, excludeOrderId: string, fallbackAmount: bigint): bigint {
+export function spentInLastDay(
+  history: any,
+  now: number,
+  excludeOrderId: string,
+  fallbackAmount: bigint,
+  excludeOrderIds: ReadonlySet<string> = new Set(),
+): bigint {
   if (!history || !Array.isArray(history.orders)) throw new Error('paid-by history has no orders list');
   let total = 0n;
   for (const order of history.orders) {
-    if (!order || order.orderId === excludeOrderId || NOT_SPENT.has(order.status)) continue;
+    if (!order || order.orderId === excludeOrderId || excludeOrderIds.has(order.orderId) || NOT_SPENT.has(order.status)) continue;
     const when = Date.parse(order.paidAt ?? order.createdAt ?? '');
     // An undated entry counts: unknown is treated as spent today.
     if (Number.isFinite(when) && now - when > DAY_MS) continue;
@@ -38,13 +44,13 @@ export function spentInLastDay(history: any, now: number, excludeOrderId: string
 
 export async function checkDailyCap(
   api: ImdApi,
-  opts: { address: string; amount: bigint; cap: bigint; decimals: number; orderId: string; now?: number },
+  opts: { address: string; amount: bigint; cap: bigint; decimals: number; orderId: string; now?: number; excludeOrderIds?: ReadonlySet<string> },
 ): Promise<bigint> {
   const res = await api.raw('GET', `/requests/paid-by/${opts.address.toLowerCase()}`, { auth: false });
   if (res.status !== 200) {
     throw new PaymentRefused(`refusing to pay: could not read today's spending (paid-by returned ${res.status})`);
   }
-  const spent = spentInLastDay(res.body, opts.now ?? Date.now(), opts.orderId, opts.amount);
+  const spent = spentInLastDay(res.body, opts.now ?? Date.now(), opts.orderId, opts.amount, opts.excludeOrderIds);
   if (spent + opts.amount > opts.cap) {
     const f = (v: bigint) => formatUnits(v, opts.decimals);
     throw new PaymentRefused(
